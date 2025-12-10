@@ -1,10 +1,12 @@
 import os
 import pandas as pd
 import re
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Set
 from dataclasses import dataclass
 from collections import defaultdict
 import json
+
+from .language_codes import convert_lang_code, detect_lang_code_format, is_google_supported
 
 @dataclass
 class Term:
@@ -13,6 +15,7 @@ class Term:
     translation: str
     domain: str
     language: str
+    google_lang_code: str  # Add Google-compatible language code
 
 class TerminologyManager:
     def __init__(self, terminologies_dir: str = None):
@@ -31,6 +34,7 @@ class TerminologyManager:
             
         self.terms_by_domain_lang = defaultdict(dict)
         self.domains_languages = set()
+        self.available_google_languages = set()
         self._load_terminologies()
     
     def _load_terminologies(self):
@@ -47,7 +51,17 @@ class TerminologyManager:
             match = pattern.match(filename)
             if match:
                 domain, language = match.groups()
+                
+                # Convert language code to Google format
+                google_lang_code = convert_lang_code(language, to_google=True)
+                
+                # Check if Google Translate supports this language
+                if not is_google_supported(language):
+                    print(f"Warning: Language '{language}' may not be fully supported by Google Translate")
+                    print(f"  Using code: '{google_lang_code}' for Google Translate")
+                
                 self.domains_languages.add((domain, language))
+                self.available_google_languages.add(google_lang_code)
                 
                 filepath = os.path.join(self.terminologies_dir, filename)
                 df = pd.read_csv(filepath)
@@ -61,7 +75,8 @@ class TerminologyManager:
                         term=str(row['term']).lower().strip(),
                         translation=str(row['translation']),
                         domain=domain,
-                        language=language
+                        language=language,
+                        google_lang_code=google_lang_code
                     )
                     terms_dict[term.term] = term
                 
@@ -71,17 +86,60 @@ class TerminologyManager:
         """Get list of available (domain, language) pairs."""
         return sorted(self.domains_languages)
     
+    def get_available_domains_languages_google(self) -> List[Tuple[str, str]]:
+        """Get list of available (domain, language) pairs with Google language codes."""
+        result = []
+        for domain, lang in self.domains_languages:
+            google_lang = convert_lang_code(lang, to_google=True)
+            result.append((domain, google_lang))
+        return sorted(result)
+    
     def get_domains(self) -> List[str]:
         """Get list of available domains."""
         return sorted({d for d, _ in self.domains_languages})
     
-    def get_languages(self) -> List[str]:
-        """Get list of available languages."""
-        return sorted({l for _, l in self.domains_languages})
+    def get_languages(self, format: str = 'original') -> List[str]:
+        """Get list of available languages.
+        
+        Args:
+            format: 'original' for original codes, 'google' for Google codes
+        """
+        languages = {l for _, l in self.domains_languages}
+        
+        if format == 'google':
+            return sorted({convert_lang_code(l, to_google=True) for l in languages})
+        else:
+            return sorted(languages)
     
     def get_terms_for_domain_lang(self, domain: str, language: str) -> Dict[str, Term]:
-        """Get all terms for a specific domain and language."""
-        return self.terms_by_domain_lang.get((domain, language), {})
+        """Get all terms for a specific domain and language.
+        
+        Args:
+            domain: Domain name
+            language: Language code (can be 2-letter or 3-letter)
+        """
+        # Try exact match first
+        if (domain, language) in self.terms_by_domain_lang:
+            return self.terms_by_domain_lang[(domain, language)]
+        
+        # If language is 2-letter, try to find matching 3-letter code
+        if len(language) == 2:
+            for (d, l), terms in self.terms_by_domain_lang.items():
+                if d == domain and convert_lang_code(l, to_google=True) == language:
+                    return terms
+        
+        # If language is 3-letter, try to convert to Google code and find
+        if len(language) == 3:
+            google_code = convert_lang_code(language, to_google=True)
+            for (d, l), terms in self.terms_by_domain_lang.items():
+                if d == domain and convert_lang_code(l, to_google=True) == google_code:
+                    return terms
+        
+        return {}
+    
+    def get_google_lang_code(self, language: str) -> str:
+        """Get Google-compatible language code for a given language code."""
+        return convert_lang_code(language, to_google=True)
     
     def preprocess_text(self, text: str, domain: str, language: str) -> Tuple[str, Dict[str, Term]]:
         """Replace terms in text with their IDs.
@@ -89,14 +147,25 @@ class TerminologyManager:
         Args:
             text: Input text
             domain: Domain name
-            language: Target language
+            language: Target language (2-letter or 3-letter code)
             
         Returns:
             Tuple of (preprocessed_text, id_to_term_mapping)
         """
         terms_dict = self.get_terms_for_domain_lang(domain, language)
         if not terms_dict:
-            raise ValueError(f"No terminology found for domain '{domain}' and language '{language}'")
+            # Try to find if domain exists with different language code
+            available_domains = self.get_domains()
+            if domain in available_domains:
+                available_langs = [l for d, l in self.domains_languages if d == domain]
+                raise ValueError(
+                    f"No terminology found for domain '{domain}' and language '{language}'. "
+                    f"Available languages for '{domain}': {available_langs}"
+                )
+            else:
+                raise ValueError(
+                    f"Domain '{domain}' not found. Available domains: {available_domains}"
+                )
         
         # Sort terms by length (longest first) to handle compound terms
         sorted_terms = sorted(terms_dict.values(), key=lambda x: len(x.term), reverse=True)
@@ -130,31 +199,3 @@ class TerminologyManager:
         for placeholder, term_obj in replacements.items():
             text = text.replace(placeholder, term_obj.translation)
         return text
-    
-    def add_terminology(self, domain: str, language: str, terms_data: List[Dict]):
-        """Add new terminology programmatically.
-        
-        Args:
-            domain: Domain name
-            language: Target language
-            terms_data: List of dictionaries with 'term' and 'translation' keys
-        """
-        key = (domain, language)
-        if key not in self.terms_by_domain_lang:
-            self.terms_by_domain_lang[key] = {}
-            self.domains_languages.add(key)
-        
-        current_max_id = max(
-            [t.id for t in self.terms_by_domain_lang[key].values()] or [0]
-        )
-        
-        for i, term_data in enumerate(terms_data, start=1):
-            term_id = current_max_id + i
-            term_obj = Term(
-                id=term_id,
-                term=term_data['term'].lower().strip(),
-                translation=term_data['translation'],
-                domain=domain,
-                language=language
-            )
-            self.terms_by_domain_lang[key][term_obj.term] = term_obj
