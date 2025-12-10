@@ -9,23 +9,6 @@ from .language_codes import convert_lang_code, is_google_supported
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-def run_async_in_sync_context(coro):
-    """
-    Run async coroutine in sync context, handling existing event loops.
-    """
-    try:
-        # Check if we're already in an event loop
-        loop = asyncio.get_running_loop()
-        # We're in an async context, need to handle differently
-        future = asyncio.run_coroutine_threadsafe(coro, loop)
-        return future.result(timeout=30)  # 30 second timeout
-    except RuntimeError:
-        # No running event loop, we can use asyncio.run
-        return asyncio.run(coro)
-    except TimeoutError:
-        logger.error("Translation timed out after 30 seconds")
-        raise
-
 class TCTranslator:
     def __init__(self, domain: str, target_lang: str, 
                  src_lang: str = 'en', terminologies_dir: str = None):
@@ -84,9 +67,9 @@ class TCTranslator:
         # Store the original language code from terminology file
         self.original_target_lang = original_target_lang
     
-    async def translate(self, text: str, **kwargs) -> Dict[str, Any]:
+    async def _translate_async(self, text: str, **kwargs) -> Dict[str, Any]:
         """
-        Translate text with terminology control.
+        Internal async translation method.
         
         Args:
             text: Text to translate
@@ -96,7 +79,6 @@ class TCTranslator:
             Dictionary with translation results
         """
         # Step 1: Preprocess - replace terms with IDs
-        # Use the original language code from terminology file
         preprocessed_text, replacements = self.terminology_manager.preprocess_text(
             text, self.domain, self.original_target_lang
         )
@@ -108,6 +90,7 @@ class TCTranslator:
         
         # Step 2: Translate with Google Translate (async)
         try:
+            # Create translator instance INSIDE the async context
             async with GoogleTranslator() as translator:
                 google_result = await translator.translate(
                     preprocessed_text,
@@ -142,9 +125,9 @@ class TCTranslator:
             logger.error(f"Translation failed: {e}")
             raise
     
-    def translate_sync(self, text: str, **kwargs) -> Dict[str, Any]:
+    def translate(self, text: str, **kwargs) -> Dict[str, Any]:
         """
-        Synchronous wrapper for translate.
+        Translate text with terminology control.
         
         Args:
             text: Text to translate
@@ -153,15 +136,58 @@ class TCTranslator:
         Returns:
             Dictionary with translation results
         """
-        return run_async_in_sync_context(self.translate(text, **kwargs))
+        # Use the same pattern as your working example
+        try:
+            # Try to get the existing event loop
+            loop = asyncio.get_event_loop()
+            
+            # If we're in Jupyter/Colab with a running loop
+            if loop.is_running():
+                # Create a new task in the existing loop
+                future = asyncio.run_coroutine_threadsafe(
+                    self._translate_async(text, **kwargs), 
+                    loop
+                )
+                return future.result(timeout=30)  # 30 second timeout
+            else:
+                # We're in a regular Python environment
+                return asyncio.run(self._translate_async(text, **kwargs))
+                
+        except RuntimeError:
+            # No event loop, create one
+            return asyncio.run(self._translate_async(text, **kwargs))
+        except TimeoutError:
+            logger.error("Translation timed out after 30 seconds")
+            raise
     
     async def batch_translate(self, texts: list, **kwargs) -> list:
         """Translate multiple texts asynchronously."""
-        return [await self.translate(text, **kwargs) for text in texts]
+        # Process one at a time to avoid rate limiting
+        results = []
+        for text in texts:
+            result = await self._translate_async(text, **kwargs)
+            results.append(result)
+            # Small delay between requests
+            await asyncio.sleep(0.1)
+        return results
     
     def batch_translate_sync(self, texts: list, **kwargs) -> list:
         """Synchronous wrapper for batch translation."""
-        return run_async_in_sync_context(self.batch_translate(texts, **kwargs))
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                future = asyncio.run_coroutine_threadsafe(
+                    self.batch_translate(texts, **kwargs), 
+                    loop
+                )
+                return future.result(timeout=300)  # 5 minute timeout for batch
+            else:
+                return asyncio.run(self.batch_translate(texts, **kwargs))
+        except RuntimeError:
+            return asyncio.run(self.batch_translate(texts, **kwargs))
+        except TimeoutError:
+            logger.error("Batch translation timed out after 5 minutes")
+            raise
 
 # Google Translate-like API wrapper
 class Translator:
@@ -171,20 +197,10 @@ class Translator:
         self.terminology_manager = TerminologyManager(terminologies_dir)
         self.terminologies_dir = terminologies_dir
     
-    async def translate(self, text: str, src: str = 'en', dest: str = 'twi', 
-                       domain: Optional[str] = None, **kwargs) -> Dict[str, Any]:
+    async def _translate_async(self, text: str, src: str = 'en', dest: str = 'twi', 
+                              domain: Optional[str] = None, **kwargs) -> Dict[str, Any]:
         """
-        Translate text with optional terminology control.
-        
-        Args:
-            text: Text to translate
-            src: Source language (2-letter or 3-letter)
-            dest: Destination language (2-letter or 3-letter)
-            domain: Domain for terminology control (optional)
-            **kwargs: Additional arguments
-            
-        Returns:
-            Dictionary with translation results
+        Internal async translation method.
         """
         if domain:
             # Use terminology-controlled translation
@@ -194,7 +210,7 @@ class Translator:
                 src_lang=src,
                 terminologies_dir=self.terminologies_dir
             )
-            return await tc_translator.translate(text, **kwargs)
+            return await tc_translator._translate_async(text, **kwargs)
         else:
             # Use regular Google Translate (async)
             async with GoogleTranslator() as translator:
@@ -216,10 +232,10 @@ class Translator:
                     'original': text
                 }
     
-    def translate_sync(self, text: str, src: str = 'en', dest: str = 'twi', 
-                      domain: Optional[str] = None, **kwargs) -> Dict[str, Any]:
+    def translate(self, text: str, src: str = 'en', dest: str = 'twi', 
+                 domain: Optional[str] = None, **kwargs) -> Dict[str, Any]:
         """
-        Synchronous wrapper for translate.
+        Translate text with optional terminology control.
         
         Args:
             text: Text to translate
@@ -231,13 +247,41 @@ class Translator:
         Returns:
             Dictionary with translation results
         """
-        return run_async_in_sync_context(self.translate(text, src, dest, domain, **kwargs))
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                future = asyncio.run_coroutine_threadsafe(
+                    self._translate_async(text, src, dest, domain, **kwargs), 
+                    loop
+                )
+                return future.result(timeout=30)
+            else:
+                return asyncio.run(self._translate_async(text, src, dest, domain, **kwargs))
+        except RuntimeError:
+            return asyncio.run(self._translate_async(text, src, dest, domain, **kwargs))
+        except TimeoutError:
+            logger.error("Translation timed out after 30 seconds")
+            raise
     
-    async def detect(self, text: str):
+    async def detect_async(self, text: str):
         """Detect language of text."""
         async with GoogleTranslator() as translator:
             return await translator.detect(text)
     
-    def detect_sync(self, text: str):
-        """Synchronous wrapper for detect."""
-        return run_async_in_sync_context(self.detect(text))
+    def detect(self, text: str):
+        """Synchronous language detection."""
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                future = asyncio.run_coroutine_threadsafe(
+                    self.detect_async(text), 
+                    loop
+                )
+                return future.result(timeout=10)
+            else:
+                return asyncio.run(self.detect_async(text))
+        except RuntimeError:
+            return asyncio.run(self.detect_async(text))
+        except TimeoutError:
+            logger.error("Language detection timed out")
+            raise
